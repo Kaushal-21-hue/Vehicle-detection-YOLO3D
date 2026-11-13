@@ -5,6 +5,7 @@ Experimental modules
 import math
 
 import numpy as np
+import inspect
 import torch
 import torch.nn as nn
 
@@ -93,7 +94,11 @@ def attempt_load(weights, map_location=None, inplace=True, fuse=True):
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
     model = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:
-        ckpt = torch.load(attempt_download(w), map_location=map_location)  # load
+        checkpoint_path = attempt_download(w)
+        load_kwargs = {'map_location': map_location}
+        if 'weights_only' in inspect.signature(torch.load).parameters:
+            load_kwargs['weights_only'] = False
+        ckpt = torch.load(checkpoint_path, **load_kwargs)  # YOLO .pt files contain trusted serialized model classes
         if fuse:
             model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().fuse().eval())  # FP32 model
         else:

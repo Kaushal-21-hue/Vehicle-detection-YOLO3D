@@ -8,6 +8,11 @@ from random import shuffle
 import sys
 from pathlib import Path
 
+import numpy as np
+
+# Initialize NumPy's MKL runtime before PyTorch initializes its bundled OpenMP runtime on Windows.
+np.linalg.lstsq(np.eye(2), np.ones((2, 1)), rcond=None)
+
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 writer = SummaryWriter()
@@ -22,12 +27,12 @@ import torch.nn as nn
 import torchvision
 from torchvision.models import resnet18, vgg11
 from torch.utils import data
+from utils.torch_utils import select_device
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 # model factory to choose model
 model_factory = {
@@ -51,12 +56,14 @@ def train(
     train_path=ROOT / 'dataset/KITTI/training',
     model_path=ROOT / 'weights/',
     select_model='resnet18',
-    api_key=''
+    api_key='',
+    device=''
     ):
 
     # directory
     train_path = str(train_path)
-    model_path = str(model_path)
+    model_path = Path(model_path)
+    device = select_device(device)
 
     # dataset
     print('[INFO] Loading dataset...')
@@ -85,29 +92,26 @@ def train(
 
     # model
     base_model = model_factory[select_model]
-    model = regressor_factory[select_model](model=base_model).cuda()
+    model = regressor_factory[select_model](model=base_model).to(device)
     
     # optimizer
     opt_SGD = torch.optim.SGD(model.parameters(), lr=hyper_params['lr'], momentum=0.9)
 
     # loss function
-    conf_loss_func = nn.CrossEntropyLoss().cuda()
-    dim_loss_func = nn.MSELoss().cuda()
+    conf_loss_func = nn.CrossEntropyLoss().to(device)
+    dim_loss_func = nn.MSELoss().to(device)
     orient_loss_func = OrientationLoss
 
     # load previous weights
     latest_model = None
     first_epoch = 1
-    if not os.path.isdir(model_path):
-        os.mkdir(model_path)
-    else:
-        try:
-            latest_model = [x for x in sorted(os.listdir(model_path)) if x.endswith('.pkl')][-1]
-        except:
-            pass
+    model_path.mkdir(parents=True, exist_ok=True)
+    checkpoints = sorted(model_path.glob('*.pkl'))
+    if checkpoints:
+        latest_model = checkpoints[-1]
 
     if latest_model is not None:
-        checkpoint = torch.load(model_path + latest_model)
+        checkpoint = torch.load(latest_model, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         opt_SGD.load_state_dict(checkpoint['optimizer_state_dict'])
         first_epoch = checkpoint['epoch']
@@ -128,12 +132,11 @@ def train(
                     tepoch.set_description(f'Epoch {epoch}')
 
                     # ground-truth
-                    truth_orient = local_labels['Orientation'].float().cuda()
-                    truth_conf = local_labels['Confidence'].float().cuda()
-                    truth_dim = local_labels['Dimensions'].float().cuda()
+                    truth_orient = local_labels['Orientation'].float().to(device)
+                    truth_conf = local_labels['Confidence'].float().to(device)
+                    truth_dim = local_labels['Dimensions'].float().to(device)
 
-                    # convert to cuda
-                    local_batch = local_batch.float().cuda()
+                    local_batch = local_batch.float().to(device)
 
                     # forward
                     [orient, conf, dim] = model(local_batch)
@@ -160,7 +163,7 @@ def train(
                     tepoch.set_postfix(loss=loss.item())
 
             if epoch % save_epoch == 0:
-                model_name = os.path.join(model_path, f'{select_model}_epoch_{epoch}.pkl')
+                model_name = model_path / f'{select_model}_epoch_{epoch}.pkl'
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
@@ -184,6 +187,7 @@ def parse_opt():
     parser.add_argument('--train_path', type=str, default=ROOT / 'dataset/KITTI/training', help='Training path KITTI')
     parser.add_argument('--model_path', type=str, default=ROOT / 'weights', help='Weights path, for load and save model')
     parser.add_argument('--select_model', type=str, default='resnet18', help='Model selection: {resnet18, vgg11}')
+    parser.add_argument('--device', type=str, default='', help='Training device (e.g. cpu or cuda:0; default: auto)')
     parser.add_argument('--api_key', type=str, default='', help='API key for comet.ml')
 
     opt = parser.parse_args()
@@ -196,5 +200,3 @@ def main(opt):
 if __name__ == '__main__':
     opt = parse_opt()
     main(opt)
-
-

@@ -2,25 +2,24 @@
 <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>YOLO3D</title>
+        <title>YOLO3D Vehicle Detection</title>
         <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css" integrity="sha384-BVYiiSIFeK1dGmJRAkycuHAHRg32OmUcww7on3RYdg4Va+PmSTsz/K68vbdEjh4u" crossorigin="anonymous">
     </head>
 
     <body>
         <div class="container">
             <div class="starter-template">
-                <h1>3D Object Detection with YOLO</h1>
-                <p>By Didi Ruhyadi - github.com/ruhyadi/yolo3d</p>
+                <h1>3D Vehicle Detection with YOLO</h1>
             </div>
         </div>
 
         <header class="navbar">
             <div align="center">
                 <h4>Upload Image</h4>
-                <form action="/upload" method="post" enctype="multipart/form-data" >
+                <form action="{{ url_for('upload_file') }}" method="post" enctype="multipart/form-data">
                     <div align="center">
                         <label class="btn btn-default btn-file">
-                            Browse Image<input type="file" name="image" style="display: none;">
+                            Browse Image<input type="file" name="image" accept=".bmp,.jpeg,.jpg,.png,.tif,.tiff,.webp" style="display: none;">
                         </label>
                         <input type="submit" value="Submit" class="btn btn-primary">
                     </div>
@@ -29,20 +28,58 @@
 
         </header>
 
+        <section class="container text-center">
+            <h4>Upload Video (MP4, AVI, or MOV)</h4>
+            <form action="{{ url_for('upload_video') }}" method="post" enctype="multipart/form-data">
+                <label class="btn btn-default btn-file">
+                    Browse Video<input type="file" name="video" accept=".mp4,.avi,.mov" required style="display: none;">
+                </label>
+                <input type="submit" value="Process Video" class="btn btn-primary">
+            </form>
+            <p class="text-muted">Processed video is saved in output_videos/.</p>
+            <p><a class="btn btn-success" href="{{ url_for('webcam_page') }}">Start Webcam (camera 0)</a></p>
+        </section>
+
         <div class="text-center">
+            {% if error %}
+                <div class="alert alert-danger" role="alert" style="margin-top:18px;">
+                    {{ error }}
+                </div>
+            {% endif %}
             {% if init %}
                 {% if detect %}
                     <div class="alert alert-success" style="margin-top:18px;">
-                        Pattern <strong>Detected</strong> on Video
+                        3D detection result
                     </div>
                     <div>
-                        <img src="{{ image_to_show }}">
-                    </div>
-                {% else %}
-                    <div class="alert alert-danger" style="margin-top:18px;">
-                        No Pattern Detected
+                        <img src="{{ image_url }}" alt="YOLO3D detection result" class="img-responsive center-block">
                     </div>
                 {% endif %}
+            {% endif %}
+            {% if video_url %}
+                <div class="alert alert-success" style="margin-top:18px;">
+                    Processed video: {{ output_name }}
+                </div>
+                <video controls autoplay class="img-responsive center-block" style="max-width:100%;">
+                    <source src="{{ video_url }}" type="video/mp4">
+                    Your browser does not support HTML video playback.
+                </video>
+                <p><a href="{{ video_url }}" download>Download processed video</a></p>
+            {% endif %}
+            {% if webcam_url %}
+                <div class="alert alert-info" style="margin-top:18px;">
+                    Live YOLO3D webcam. Press Q to stop; the recording is saved in output_videos/.
+                </div>
+                <img id="webcam-stream" src="{{ webcam_url }}" alt="Live YOLO3D webcam" class="img-responsive center-block">
+                <script>
+                    document.addEventListener('keydown', function (event) {
+                        if (event.key.toLowerCase() === 'q') {
+                            var stream = document.getElementById('webcam-stream');
+                            stream.removeAttribute('src');
+                            stream.alt = 'Webcam stopped.';
+                        }
+                    });
+                </script>
             {% endif %}
         </div>
     </body>

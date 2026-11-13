@@ -6,16 +6,18 @@ import numpy as np
 
 def get_P(calib_file):
     """
-    Get matrix P_rect_02 (camera 2 RGB)
-    and transform to 3 x 4 matrix
+    Read the camera-2 projection matrix from KITTI calibration files.
     """
-    for line in open(calib_file):
-        if 'P_rect_02' in line:
-            cam_P = line.strip().split(' ')
-            cam_P = np.asarray([float(cam_P) for cam_P in cam_P[1:]])
-            matrix = np.zeros((3, 4))
-            matrix = cam_P.reshape((3, 4))
-            return matrix
+    with open(calib_file) as calibration:
+        for line in calibration:
+            key, separator, values = line.partition(':')
+            if separator and key.strip() in {'P_rect_02', 'P2'}:
+                projection = np.fromstring(values, sep=' ')
+                if projection.size != 12:
+                    raise ValueError(f'Expected 12 projection values in {calib_file}, found {projection.size}')
+                return projection.reshape((3, 4))
+
+    raise ValueError(f'No camera-2 projection matrix (P_rect_02 or P2) in {calib_file}')
 
 # TODO: understand this
 
@@ -58,4 +60,3 @@ def get_tr_to_velo(cab_f):
 def file_not_found(filename):
     print("\nError! Can't read calibration file, does %s exist?"%filename)
     exit()
-

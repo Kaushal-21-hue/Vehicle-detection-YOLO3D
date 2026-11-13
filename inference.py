@@ -4,42 +4,42 @@ Run inference on images, videos, directories, streams, etc.
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 import glob
+
+import numpy as np
+
+# Initialize NumPy's MKL runtime before PyTorch initializes its bundled OpenMP runtime on Windows.
+np.linalg.lstsq(np.eye(2), np.ones((2, 1)), rcond=None)
 
 import cv2
 import torch
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # YOLOv5 root directory
+ROOT = FILE.parents[0]
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))  # add ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+    sys.path.append(str(ROOT))
 
 from models.common import DetectMultiBackend
+from utils.augmentations import letterbox
 from utils.datasets import LoadImages
-from utils.general import LOGGER, check_img_size, check_requirements, non_max_suppression, print_args, scale_coords
+from utils.general import LOGGER, check_img_size, non_max_suppression, print_args, scale_coords
 from utils.torch_utils import select_device, time_sync
 
-import torch
-import torch.nn as nn
 from torchvision.models import resnet18, vgg11
 
-import numpy as np
-
 from script.Dataset import generate_bins, DetectedObject
+from library.Calib import get_P
 from library.Math import *
 from library.Plotting import *
-from script import Model, ClassAverages
+from script import ClassAverages
 from script.Model import ResNet, ResNet18, VGG11
 
-# model factory to choose model
 model_factory = {
-    'resnet': resnet18(pretrained=True),
-    'resnet18': resnet18(pretrained=True),
-    # 'vgg11': vgg11(pretrained=True)
+    'resnet': lambda: resnet18(weights=None),
+    'resnet18': lambda: resnet18(weights=None),
+    'vgg11': lambda: vgg11(weights=None),
 }
 regressor_factory = {
     'resnet': ResNet,
@@ -47,11 +47,181 @@ regressor_factory = {
     'vgg11': VGG11
 }
 
+IMAGE_EXTENSIONS = {'.bmp', '.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp'}
+
+
+def project_path(path):
+    path = Path(path)
+    return path if path.is_absolute() else ROOT / path
+
+
+def source_images(source):
+    source_path = project_path(source)
+    if source_path.is_file():
+        paths = [source_path]
+    elif source_path.is_dir():
+        paths = sorted(path for path in source_path.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
+    else:
+        paths = [
+            Path(path) for path in sorted(glob.glob(str(source_path)))
+            if Path(path).suffix.lower() in IMAGE_EXTENSIONS
+        ]
+
+    if not paths:
+        raise FileNotFoundError(f'No supported image files found at {source_path}')
+    return paths
+
+
+def load_regressor_checkpoint(checkpoint_path, regressor, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f'Checkpoint must be a mapping, got {type(checkpoint).__name__}')
+
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+
+    if not isinstance(state_dict, dict):
+        raise TypeError('Checkpoint model state must be a mapping of parameter names to tensors')
+
+    try:
+        regressor.load_state_dict(state_dict, strict=True)
+    except RuntimeError as error:
+        raise RuntimeError(f'Checkpoint does not match the selected regressor architecture: {error}') from error
+
+
 class Bbox:
-    def __init__(self, box_2d, class_):
+    def __init__(self, box_2d, class_, confidence=None):
         self.box_2d = box_2d
         self.detected_class = class_
+        self.confidence = confidence
 
+class YOLO3DPipeline:
+    """Load the 2D detector and 3D regressor once for image or video inference."""
+
+    def __init__(
+        self,
+        reg_weights,
+        model_select,
+        calib_file,
+        device='',
+        detector_weights=ROOT / 'yolov5s.pt',
+        data=ROOT / 'data/coco128.yaml',
+        imgsz=(640, 640),
+        classes=(2, 5, 7),
+    ):
+        self.device = select_device(device)
+        self.calib_path = project_path(calib_file)
+        if not self.calib_path.is_file():
+            raise FileNotFoundError(f'Calibration file not found: {self.calib_path}')
+        self.proj_matrix = get_P(str(self.calib_path))
+
+        checkpoint_path = project_path(reg_weights)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f'Regressor checkpoint not found: {checkpoint_path}')
+        if model_select not in model_factory:
+            raise ValueError(f'Unsupported regressor model {model_select!r}; choose from {", ".join(model_factory)}')
+
+        detector_weights = (
+            [project_path(path) for path in detector_weights]
+            if isinstance(detector_weights, (list, tuple))
+            else project_path(detector_weights)
+        )
+        detector_paths = detector_weights if isinstance(detector_weights, list) else [detector_weights]
+        for path in detector_paths:
+            if not path.is_file():
+                raise FileNotFoundError(f'Detector weights not found: {path}')
+        data = project_path(data)
+        if not data.is_file():
+            raise FileNotFoundError(f'Detector dataset configuration not found: {data}')
+
+        base_model = model_factory[model_select]()
+        self.regressor = regressor_factory[model_select](model=base_model).to(self.device)
+        load_regressor_checkpoint(checkpoint_path, self.regressor, self.device)
+        self.regressor.eval()
+
+        self.detector = DetectMultiBackend(detector_weights, device=self.device, dnn=False, data=data)
+        self.stride = self.detector.stride
+        self.pt = self.detector.pt
+        self.imgsz = check_img_size(list(imgsz), s=self.stride)
+        self.detector.warmup(imgsz=(1, 3, *self.imgsz), half=False)
+        self.classes = list(classes) if classes is not None else None
+        self.averages = ClassAverages.ClassAverages()
+        self.angle_bins = generate_bins(2)
+
+    @torch.no_grad()
+    def detect_frame(self, img):
+        """Run genuine 2D + 3D inference on one OpenCV BGR frame, modifying it in place."""
+        if img is None or img.ndim != 3 or img.shape[0] <= 0 or img.shape[1] <= 0:
+            raise ValueError('Expected a non-empty three-channel image frame')
+
+        resized = letterbox(img, self.imgsz, stride=self.stride, auto=self.pt)[0]
+        resized = resized.transpose((2, 0, 1))[::-1]
+        resized = np.ascontiguousarray(resized)
+        tensor = torch.from_numpy(resized).to(self.device).float() / 255.0
+        tensor = tensor.unsqueeze(0)
+
+        prediction = self.detector(tensor, augment=False, visualize=False)
+        detections = non_max_suppression(prediction, classes=self.classes)
+        for det in detections:
+            if not len(det):
+                continue
+            det[:, :4] = scale_coords(tensor.shape[2:], det[:, :4], img.shape).round()
+            for *xyxy, confidence, class_id in reversed(det):
+                class_name = self.detector.names[int(class_id)]
+                coords = [int(value) for value in torch.tensor(xyxy).view(-1).tolist()]
+                box_2d = [(coords[0], coords[1]), (coords[2], coords[3])]
+                supported = self.averages.recognized_class(class_name)
+                if supported:
+                    supported = self.averages.dimension_map[class_name.lower()]['count'] > 0
+                if not supported:
+                    cv2.rectangle(img, box_2d[0], box_2d[1], (0, 165, 255), 2)
+                    cv2.putText(
+                        img, f'{class_name} {float(confidence):.0%} | 3D unavailable',
+                        (box_2d[0][0], max(18, box_2d[0][1] - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2, cv2.LINE_AA
+                    )
+                    continue
+                try:
+                    detected = DetectedObject(img, class_name, box_2d, self.proj_matrix)
+                    orient, orientation_confidence, dimensions = self.regressor(
+                        detected.img.unsqueeze(0).to(self.device)
+                    )
+                    orient = orient.cpu().numpy()[0]
+                    orientation_confidence = orientation_confidence.cpu().numpy()[0]
+                    dimensions = dimensions.cpu().numpy()[0] + self.averages.get_item(class_name)
+
+                    bin_index = int(np.argmax(orientation_confidence))
+                    alpha = np.arctan2(orient[bin_index, 1], orient[bin_index, 0])
+                    alpha += self.angle_bins[bin_index] - np.pi
+                    location = plot3d(
+                        img, self.proj_matrix, box_2d, dimensions, alpha, detected.theta_ray
+                    )
+                except (IndexError, ValueError, ZeroDivisionError, np.linalg.LinAlgError) as error:
+                    LOGGER.warning('Skipping invalid 3D detection %s: %s', box_2d, error)
+                    continue
+
+                confidence_value = float(confidence)
+                orientation = alpha + detected.theta_ray
+                cv2.rectangle(img, box_2d[0], box_2d[1], (0, 255, 0), 2)
+                label = f'{class_name} {confidence_value:.0%}'
+                label += f' | {location[2]:.1f}m | yaw {np.degrees(orientation):.0f} deg'
+                cv2.putText(
+                    img, label, (box_2d[0][0], max(18, box_2d[0][1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA
+                )
+                size_label = 'H {:.1f} W {:.1f} L {:.1f}m'.format(*dimensions)
+                cv2.putText(
+                    img, size_label, (box_2d[0][0], min(img.shape[0] - 5, box_2d[1][1] + 18)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA
+                )
+        return img
+
+
+@torch.no_grad()
 def detect3d(
     reg_weights,
     model_select,
@@ -59,86 +229,36 @@ def detect3d(
     calib_file,
     show_result,
     save_result,
-    output_path
+    output_path,
+    device='',
+    detector_weights=ROOT / 'yolov5s.pt',
+    data=ROOT / 'data/coco128.yaml',
+    imgsz=(640, 640),
+    classes=(2, 5, 7)
     ):
 
-    # Directory
-    imgs_path = sorted(glob.glob(str(source) + '/*'))
-    calib = str(calib_file)
+    imgs_path = source_images(source)
+    pipeline = YOLO3DPipeline(
+        reg_weights, model_select, calib_file, device, detector_weights, data, imgsz, classes
+    )
+    output_path = project_path(output_path) if output_path is not None else None
+    if output_path is not None and save_result:
+        output_path.mkdir(parents=True, exist_ok=True)
 
-    # load model
-    base_model = model_factory[model_select]
-    regressor = regressor_factory[model_select](model=base_model).cuda()
-
-    # load weight
-    checkpoint = torch.load(reg_weights)
-    regressor.load_state_dict(checkpoint['model_state_dict'])
-    regressor.eval()
-
-    averages = ClassAverages.ClassAverages()
-    angle_bins = generate_bins(2)
-
-    # loop images
-    for i, img_path in enumerate(imgs_path):
-        # read image
-        img = cv2.imread(img_path)
-        
-        # Run detection 2d
-        dets = detect2d(
-            weights='yolov5s.pt',
-            source=img_path,
-            data='data/coco128.yaml',
-            imgsz=[640, 640],
-            device=0,
-            classes=[0, 2, 3, 5]
-        )
-
-        for det in dets:
-            if not averages.recognized_class(det.detected_class):
-                continue
-            try: 
-                detectedObject = DetectedObject(img, det.detected_class, det.box_2d, calib)
-            except:
-                continue
-
-            theta_ray = detectedObject.theta_ray
-            input_img = detectedObject.img
-            proj_matrix = detectedObject.proj_matrix
-            box_2d = det.box_2d
-            detected_class = det.detected_class
-
-            input_tensor = torch.zeros([1,3,224,224]).cuda()
-            input_tensor[0,:,:,:] = input_img
-
-            # predict orient, conf, and dim
-            [orient, conf, dim] = regressor(input_tensor)
-            orient = orient.cpu().data.numpy()[0, :, :]
-            conf = conf.cpu().data.numpy()[0, :]
-            dim = dim.cpu().data.numpy()[0, :]
-
-            dim += averages.get_item(detected_class)
-
-            argmax = np.argmax(conf)
-            orient = orient[argmax, :]
-            cos = orient[0]
-            sin = orient[1]
-            alpha = np.arctan2(sin, cos)
-            alpha += angle_bins[argmax]
-            alpha -= np.pi
-
-            # plot 3d detection
-            plot3d(img, proj_matrix, box_2d, dim, alpha, theta_ray)
+    for img_path in imgs_path:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            raise ValueError(f'Could not decode image: {img_path}')
+        pipeline.detect_frame(img)
 
         if show_result:
             cv2.imshow('3d detection', img)
             cv2.waitKey(0)
 
         if save_result and output_path is not None:
-            try:
-                os.mkdir(output_path)
-            except:
-                pass
-            cv2.imwrite(f'{output_path}/{i:03d}.png', img)
+            result_path = output_path / f'{img_path.stem}_3d.png'
+            if not cv2.imwrite(str(result_path), img):
+                raise OSError(f'Could not write inference result: {result_path}')
 
 @torch.no_grad()
 def detect2d(
@@ -199,6 +319,7 @@ def detect2d(
             s += '%gx%g ' % im.shape[2:]  # print string
 
             if len(det):
+                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
                 # Print results
                 for c in det[:, -1].unique():
@@ -214,7 +335,7 @@ def detect2d(
                     c = int(cls)  # integer class
                     label = names[c]
 
-                    bbox_list.append(Bbox(bbox, label))
+                    bbox_list.append(Bbox(bbox, label, float(conf)))
 
             # Print time (inference-only)
             LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
@@ -253,10 +374,10 @@ def parse_opt():
     parser.add_argument('--source', type=str, default=ROOT / 'eval/image_2', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--classes', default=[0, 2, 3, 5], nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
-    parser.add_argument('--reg_weights', type=str, default='weights/epoch_10.pkl', help='Regressor model weights')
-    parser.add_argument('--model_select', type=str, default='resnet', help='Regressor model list: resnet, vgg, eff')
+    parser.add_argument('--device', default='', help='device to run on, e.g. 0, 0,1,2,3, or cpu (default: auto)')
+    parser.add_argument('--classes', default=[2, 5, 7], nargs='+', type=int, help='vehicle class IDs: car=2, bus=5, truck=7')
+    parser.add_argument('--reg_weights', type=str, default=ROOT / 'weights/resnet18.pkl', help='Regressor model weights')
+    parser.add_argument('--model_select', type=str, default='resnet18', choices=tuple(regressor_factory), help='Regressor model')
     parser.add_argument('--calib_file', type=str, default=ROOT / 'eval/camera_cal/calib_cam_to_cam.txt', help='Calibration file or path')
     parser.add_argument('--show_result', action='store_true', help='Show Results with imshow')
     parser.add_argument('--save_result', action='store_true', help='Save result')
@@ -275,7 +396,12 @@ def main(opt):
         calib_file=opt.calib_file,
         show_result=opt.show_result,
         save_result=opt.save_result,
-        output_path=opt.output_path
+        output_path=opt.output_path,
+        device=opt.device,
+        detector_weights=opt.weights,
+        data=opt.data,
+        imgsz=opt.imgsz,
+        classes=opt.classes
     )
 
 if __name__ == "__main__":

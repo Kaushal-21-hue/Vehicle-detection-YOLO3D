@@ -52,7 +52,7 @@ def project_3d_pt(pt, cam_to_img, calib_file=None):
     # point = np.dot(np.dot(np.dot(cam_to_img, R0_rect), Tr_velo_to_cam), point)
 
     point = point[:2]/point[2]
-    point = point.astype(np.int16)
+    point = point.astype(np.int32)
 
     return point
 
@@ -92,8 +92,6 @@ def plot_3d_box(img, cam_to_img, ry, dimension, center):
     box_3d = []
     for corner in corners:
         point = project_3d_pt(corner, cam_to_img)
-        point[0] =(int)(point[0]*1242/640) # change 1242x375 to whatever your im0.shape is
-        point[1] =(int)(point[1]*375/224)
         box_3d.append(point)
 
     #LINE
